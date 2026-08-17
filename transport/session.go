@@ -274,15 +274,19 @@ func (s *session) Reset() {
 }
 
 func (s *session) Conn() net.Conn {
-	if tc, ok := s.Connection.(*gettyTCPConn); ok {
+	s.lock.RLock()
+	conn := s.Connection
+	s.lock.RUnlock()
+
+	if tc, ok := conn.(*gettyTCPConn); ok {
 		return tc.conn
 	}
 
-	if uc, ok := s.Connection.(*gettyUDPConn); ok {
+	if uc, ok := conn.(*gettyUDPConn); ok {
 		return uc.conn
 	}
 
-	if wc, ok := s.Connection.(*gettyWSConn); ok {
+	if wc, ok := conn.(*gettyWSConn); ok {
 		return wc.conn.UnderlyingConn()
 	}
 
@@ -295,16 +299,21 @@ func (s *session) EndPoint() EndPoint {
 	return s.endPoint
 }
 
+// gettyConn takes s.lock itself; do not call it while holding the lock.
 func (s *session) gettyConn() *gettyConn {
-	if tc, ok := s.Connection.(*gettyTCPConn); ok {
+	s.lock.RLock()
+	conn := s.Connection
+	s.lock.RUnlock()
+
+	if tc, ok := conn.(*gettyTCPConn); ok {
 		return &(tc.gettyConn)
 	}
 
-	if uc, ok := s.Connection.(*gettyUDPConn); ok {
+	if uc, ok := conn.(*gettyUDPConn); ok {
 		return &(uc.gettyConn)
 	}
 
-	if wc, ok := s.Connection.(*gettyWSConn); ok {
+	if wc, ok := conn.(*gettyWSConn); ok {
 		return &(wc.gettyConn)
 	}
 
@@ -514,8 +523,8 @@ func (s *session) WritePkg(pkg any, timeout time.Duration) (pkgBytesLenth int, s
 	// gc() later nils the field, because they reference the underlying obj.
 	s.lock.RLock()
 	conn := s.Connection
-	gc := s.gettyConn()
 	s.lock.RUnlock()
+	gc := s.gettyConn()
 	if conn == nil || gc == nil {
 		return 0, 0, ErrSessionClosed
 	}
@@ -1118,7 +1127,10 @@ func (s *session) gc() {
 			defer lifecycle.release()
 		}
 		if conn != nil {
-			conn.CloseConn(int(wait))
+			// CloseConn takes seconds (SetLinger); wait is a time.Duration in
+			// nanoseconds, so a plain int(wait) overflows int32 in the linger
+			// syscall and blocks Close for minutes (issue #112).
+			conn.CloseConn(int(wait / time.Second))
 		}
 	}(conn, wait, lifecycle)
 }
@@ -1218,10 +1230,14 @@ func (s *session) Send(pkg any) (int, error) {
 	if s == nil {
 		return 0, nil
 	}
+	// snapshot and release: gettyUDPConn.Send calls back s.EndPoint(), which
+	// takes s.lock.RLock() again. Holding the lock across Connection.Send would
+	// be a recursive RLock and deadlock with a queued writer (issue #112).
 	s.lock.RLock()
-	defer s.lock.RUnlock()
-	if s.Connection != nil {
-		return s.Connection.Send(pkg)
+	conn := s.Connection
+	s.lock.RUnlock()
+	if conn != nil {
+		return conn.Send(pkg)
 	}
 	return 0, nil
 }
@@ -1234,6 +1250,21 @@ func (s *session) ReadTimeout() time.Duration {
 	defer s.lock.RUnlock()
 	if s.Connection != nil {
 		return s.Connection.ReadTimeout()
+	}
+	return time.Duration(0)
+}
+
+// WriteTimeout overrides the promoted Connection method with the same nil
+// guard as ReadTimeout: stop() calls it while gc()/Reset() may have nil-ed
+// s.Connection.
+func (s *session) WriteTimeout() time.Duration {
+	if s == nil {
+		return time.Duration(0)
+	}
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	if s.Connection != nil {
+		return s.Connection.WriteTimeout()
 	}
 	return time.Duration(0)
 }

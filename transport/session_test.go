@@ -21,6 +21,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -369,4 +370,54 @@ func TestHandlePackageWithNilListenerDoesNotPanicOnError(t *testing.T) {
 	}
 
 	ss.handlePackage()
+}
+
+// TestUDPSendEndPointNoRecursiveRLockDeadlock is the regression for issue
+// #112: session.Send used to hold s.lock.RLock() across gettyUDPConn.Send,
+// which calls back s.EndPoint() and takes the same read lock again. With a
+// writer queued between the two reads (RWMutex is writer-preferring), both
+// goroutines deadlocked forever.
+func TestUDPSendEndPointNoRecursiveRLockDeadlock(t *testing.T) {
+	srv := newServer(UDP_ENDPOINT, WithLocalAddress("127.0.0.1:0"))
+	laddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.ListenUDP("udp", laddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	peer, err := net.ResolveUDPAddr("udp", "127.0.0.1:65531")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ss := newUDPSession(conn, srv)
+
+	sent := make(chan struct{})
+	go func() { // takes the read lock in Send and again in the EndPoint callback
+		for i := 0; i < 20000; i++ {
+			_, _ = ss.Send(UDPContext{Pkg: []byte("x"), PeerAddr: peer})
+		}
+		close(sent)
+	}()
+	go func() { // the queued writer that turns the recursive RLock into a deadlock
+		for {
+			select {
+			case <-sent:
+				return
+			default:
+			}
+			ss.SetAttribute("k", "v")
+		}
+	}()
+
+	select {
+	case <-sent:
+	case <-time.After(30 * time.Second):
+		buf := make([]byte, 1<<16)
+		n := runtime.Stack(buf, true)
+		t.Fatalf("DEADLOCK: sender stuck in session.Send -> EndPoint\n%s", buf[:n])
+	}
 }
