@@ -173,14 +173,30 @@ func BenchmarkEchoUDP(b *testing.B) {
 			b.ReportAllocs()
 			b.StartTimer()
 
+			// udp may lose a datagram, so a missing reply is a bounded retry, not
+			// a 30 second wait: the loss is counted and reported instead of
+			// turning the whole suite red.
 			ctx := getty.UDPContext{Pkg: payload}
+			var lost int64
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
 				if _, _, err := ss.WritePkg(ctx, 0); err != nil {
 					b.Fatal(err)
 				}
-				e.waitReply(b)
+				for attempt := 1; !e.waitReplyWithin(udpReplyTimeout); attempt++ {
+					lost++
+					if attempt > udpMaxRetries {
+						b.Fatalf("udp echo lost %d consecutive replies (server received %d datagrams, client received %d)",
+							attempt, e.serverRecv.Load(), e.clientRecv.Load())
+					}
+					if _, _, err := ss.WritePkg(ctx, 0); err != nil {
+						b.Fatal(err)
+					}
+				}
 				latency.record(time.Since(start))
+			}
+			if lost > 0 {
+				b.ReportMetric(float64(lost), "lost")
 			}
 			latency.report(b)
 		})

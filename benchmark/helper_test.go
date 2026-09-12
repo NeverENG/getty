@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -51,6 +52,13 @@ const (
 	// replyTimeout turns "the peer never echoed" into a failure instead of a
 	// hang.
 	replyTimeout = 30 * time.Second
+	// udpReplyTimeout bounds one datagram round trip. udp may lose a datagram,
+	// so a udp benchmark retries instead of waiting out replyTimeout.
+	udpReplyTimeout = time.Second
+	// udpWarmupAttempts bounds the pre-measurement round trip.
+	udpWarmupAttempts = 5
+	// udpMaxRetries bounds the resends for one lost reply inside the loop.
+	udpMaxRetries = 3
 	// maxMsgLen must exceed every echoed payload: session.handleTCPPackage and
 	// handleWSPackage drop any pkg larger than maxMsgLen, whose default is 4KB,
 	// so a 16KB echo would silently never come back.
@@ -170,17 +178,21 @@ func (udpEchoCodec) Write(_ getty.Session, pkg any) ([]byte, error) {
 	return body, nil
 }
 
-// udpEchoListener writes each datagram back to whoever sent it.
-type udpEchoListener struct{}
+// udpEchoListener writes each datagram back to whoever sent it, and counts what
+// it saw.
+type udpEchoListener struct{ recv *atomic.Int64 }
 
 func (udpEchoListener) OnOpen(getty.Session) error   { return nil }
 func (udpEchoListener) OnClose(getty.Session)        {}
 func (udpEchoListener) OnError(getty.Session, error) {}
 func (udpEchoListener) OnCron(getty.Session)         {}
-func (udpEchoListener) OnMessage(ss getty.Session, pkg any) {
+func (l udpEchoListener) OnMessage(ss getty.Session, pkg any) {
 	ctx, ok := pkg.(getty.UDPContext)
 	if !ok {
 		return
+	}
+	if l.recv != nil {
+		l.recv.Add(1)
 	}
 	_, _, _ = ss.WritePkg(ctx, 0)
 }
@@ -265,13 +277,19 @@ func (echoListener) OnMessage(ss getty.Session, pkg any) {
 }
 
 // replyListener signals the benchmark goroutine once per echoed pkg.
-type replyListener struct{ replies chan<- struct{} }
+type replyListener struct {
+	replies chan<- struct{}
+	recv    *atomic.Int64
+}
 
 func (replyListener) OnOpen(getty.Session) error   { return nil }
 func (replyListener) OnClose(getty.Session)        {}
 func (replyListener) OnError(getty.Session, error) {}
 func (replyListener) OnCron(getty.Session)         {}
 func (l replyListener) OnMessage(getty.Session, any) {
+	if l.recv != nil {
+		l.recv.Add(1)
+	}
 	l.replies <- struct{}{}
 }
 
@@ -372,12 +390,16 @@ func (l *latencyRecorder) record(d time.Duration) {
 	l.samples = append(l.samples, d)
 }
 
-// report publishes p50/p99/p999 as user metrics. It is a no-op when nothing was
-// recorded, so a benchmark that fails early does not report zeros.
+// report publishes p50/p99/p999 as user metrics. It stops the benchmark timer
+// first: the copy and the O(n log n) sort below would otherwise be charged to
+// ns/op, which would make two runs with different b.N incomparable. It is a
+// no-op when nothing was recorded, so a benchmark that fails early does not
+// report zeros.
 func (l *latencyRecorder) report(b *testing.B) {
 	if len(l.samples) == 0 {
 		return
 	}
+	b.StopTimer()
 	sorted := append([]time.Duration(nil), l.samples...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	percentile := func(p float64) float64 {
@@ -396,6 +418,10 @@ type benchEcho struct {
 	sessions   []getty.Session
 	replies    chan struct{}
 	replyTimer *time.Timer
+	// serverRecv and clientRecv exist so that a udp round trip that never
+	// completes can say *where* it broke instead of just timing out.
+	serverRecv *atomic.Int64
+	clientRecv *atomic.Int64
 }
 
 // newBenchEcho starts a server and a client pool of conns sessions, all sharing
@@ -407,6 +433,8 @@ func newBenchEcho(b *testing.B, transport string, codec getty.ReadWriter, compre
 	e := &benchEcho{
 		replies:    make(chan struct{}, replyBuffer),
 		replyTimer: time.NewTimer(replyTimeout),
+		serverRecv: &atomic.Int64{},
+		clientRecv: &atomic.Int64{},
 	}
 	// Registered before anything can fail, so a dial timeout or an unsupported
 	// transport still tears down whatever was already started instead of leaving
@@ -449,7 +477,7 @@ func newBenchEcho(b *testing.B, transport string, codec getty.ReadWriter, compre
 	// RunEventLoop blocks until the pool is dialled; run it in the background
 	// so a server that never accepts cannot pin the benchmark setup forever.
 	go e.cli.RunEventLoop(func(ss getty.Session) error {
-		setHandler(ss, codec, replyListener{replies: e.replies}, compress)
+		setHandler(ss, codec, replyListener{replies: e.replies, recv: e.clientRecv}, compress)
 		ready <- ss
 		return nil
 	})
@@ -485,7 +513,7 @@ func newBenchUDPEcho(b *testing.B, e *benchEcho, codec getty.ReadWriter) *benchE
 
 	e.srv = getty.NewUDPEndPoint(getty.WithLocalAddress("127.0.0.1:0"))
 	e.srv.RunEventLoop(func(ss getty.Session) error {
-		setHandler(ss, codec, udpEchoListener{}, getty.CompressNone)
+		setHandler(ss, codec, udpEchoListener{recv: e.serverRecv}, getty.CompressNone)
 		return nil
 	})
 	addr := e.srv.(getty.PacketServer).PacketConn().LocalAddr().String()
@@ -493,7 +521,7 @@ func newBenchUDPEcho(b *testing.B, e *benchEcho, codec getty.ReadWriter) *benchE
 	ready := make(chan getty.Session, 1)
 	e.cli = getty.NewUDPClient(getty.WithServerAddress(addr), getty.WithConnectionNumber(1))
 	go e.cli.RunEventLoop(func(ss getty.Session) error {
-		setHandler(ss, codec, replyListener{replies: e.replies}, getty.CompressNone)
+		setHandler(ss, codec, replyListener{replies: e.replies, recv: e.clientRecv}, getty.CompressNone)
 		ready <- ss
 		return nil
 	})
@@ -504,7 +532,31 @@ func newBenchUDPEcho(b *testing.B, e *benchEcho, codec getty.ReadWriter) *benchE
 	case <-time.After(dialTimeout):
 		b.Fatal("udp client session did not come up")
 	}
+
+	e.warmUpUDP(b)
 	return e
+}
+
+// A udp round trip is not guaranteed, and the client's own dial does a
+// write-then-read handshake with a one second deadline before the session even
+// exists (transport/client.go dialUDP), so the first datagrams of a benchmark
+// are the most likely to be dropped or eaten. Establishing one round trip
+// before measuring keeps the measured loop from timing out on a cold start, and
+// the counters below say exactly where it broke when it cannot.
+func (e *benchEcho) warmUpUDP(b *testing.B) {
+	b.Helper()
+	payload := benchPayload(16)
+	for attempt := 1; attempt <= udpWarmupAttempts; attempt++ {
+		if _, _, err := e.sessions[0].WritePkg(getty.UDPContext{Pkg: payload}, 0); err != nil {
+			b.Fatalf("udp warmup write: %v", err)
+		}
+		if e.waitReplyWithin(udpReplyTimeout) {
+			return
+		}
+	}
+	b.Skipf("udp echo round trip could not be established in %d attempts: the server received %d datagrams, the client received %d. "+
+		"The udp endpoint round trip needs a look before this case can be measured; skipping it rather than failing every other case.",
+		udpWarmupAttempts, e.serverRecv.Load(), e.clientRecv.Load())
 }
 
 func setHandler(ss getty.Session, codec getty.ReadWriter, listener getty.EventListener, compress getty.CompressType) {
@@ -526,18 +578,27 @@ func setHandler(ss getty.Session, codec getty.ReadWriter, listener getty.EventLi
 // its runtime timer churn into ns/op and allocs/op.
 func (e *benchEcho) waitReply(b *testing.B) {
 	b.Helper()
+	if !e.waitReplyWithin(replyTimeout) {
+		b.Fatalf("no echo came back within %s: the session dropped the pkg (maxMsgLen) or the peer died", replyTimeout)
+	}
+}
+
+// waitReplyWithin is waitReply with a caller-chosen bound, so a udp benchmark can
+// treat a missing datagram as a loss instead of a 30 second wall.
+func (e *benchEcho) waitReplyWithin(d time.Duration) bool {
 	if !e.replyTimer.Stop() {
 		select {
 		case <-e.replyTimer.C:
 		default:
 		}
 	}
-	e.replyTimer.Reset(replyTimeout)
+	e.replyTimer.Reset(d)
 
 	select {
 	case <-e.replies:
+		return true
 	case <-e.replyTimer.C:
-		b.Fatal("no echo came back: the session dropped the pkg (maxMsgLen) or the peer died")
+		return false
 	}
 }
 
