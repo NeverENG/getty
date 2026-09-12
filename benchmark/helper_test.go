@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -143,6 +144,45 @@ func (udpCodec) Write(_ getty.Session, pkg any) ([]byte, error) {
 		return nil, fmt.Errorf("udpCodec: unexpected UDPContext.Pkg type %T", ctx.Pkg)
 	}
 	return body, nil
+}
+
+// udpEchoCodec turns each datagram into one pkg, and unwraps the UDPContext a
+// udp session must be written with. handleUDPPackage hands OnMessage a
+// UDPContext{Pkg: <what Read returned>, PeerAddr: <sender>}, so echoing is just
+// writing that same context back.
+type udpEchoCodec struct{}
+
+func (udpEchoCodec) Read(_ getty.Session, data []byte) (any, int, error) {
+	body := make([]byte, len(data))
+	copy(body, data)
+	return body, len(data), nil
+}
+
+func (udpEchoCodec) Write(_ getty.Session, pkg any) ([]byte, error) {
+	ctx, ok := pkg.(getty.UDPContext)
+	if !ok {
+		return nil, fmt.Errorf("udpEchoCodec: unexpected pkg type %T", pkg)
+	}
+	body, ok := ctx.Pkg.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("udpEchoCodec: unexpected UDPContext.Pkg type %T", ctx.Pkg)
+	}
+	return body, nil
+}
+
+// udpEchoListener writes each datagram back to whoever sent it.
+type udpEchoListener struct{}
+
+func (udpEchoListener) OnOpen(getty.Session) error   { return nil }
+func (udpEchoListener) OnClose(getty.Session)        {}
+func (udpEchoListener) OnError(getty.Session, error) {}
+func (udpEchoListener) OnCron(getty.Session)         {}
+func (udpEchoListener) OnMessage(ss getty.Session, pkg any) {
+	ctx, ok := pkg.(getty.UDPContext)
+	if !ok {
+		return
+	}
+	_, _, _ = ss.WritePkg(ctx, 0)
 }
 
 // lengthPrefixedCodec frames each pkg as a 4-byte big-endian length plus body.
@@ -316,9 +356,42 @@ func newWriteSession(b *testing.B, codec getty.ReadWriter, compress getty.Compre
 	}
 }
 
+// latencyRecorder keeps one sample per round trip so a benchmark can report
+// tail percentiles. A mean hides the p99 that RPC users actually feel, and
+// ns/op alone cannot show it. Samples are written into a slice preallocated to
+// b.N, so recording costs an append into existing capacity, not an allocation.
+type latencyRecorder struct {
+	samples []time.Duration
+}
+
+func newLatencyRecorder(n int) *latencyRecorder {
+	return &latencyRecorder{samples: make([]time.Duration, 0, n)}
+}
+
+func (l *latencyRecorder) record(d time.Duration) {
+	l.samples = append(l.samples, d)
+}
+
+// report publishes p50/p99/p999 as user metrics. It is a no-op when nothing was
+// recorded, so a benchmark that fails early does not report zeros.
+func (l *latencyRecorder) report(b *testing.B) {
+	if len(l.samples) == 0 {
+		return
+	}
+	sorted := append([]time.Duration(nil), l.samples...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	percentile := func(p float64) float64 {
+		idx := int(float64(len(sorted)-1) * p)
+		return float64(sorted[idx].Nanoseconds())
+	}
+	b.ReportMetric(percentile(0.5), "p50-ns")
+	b.ReportMetric(percentile(0.99), "p99-ns")
+	b.ReportMetric(percentile(0.999), "p999-ns")
+}
+
 // benchEcho is a live getty client/server echo pair over loopback.
 type benchEcho struct {
-	srv        getty.StreamServer
+	srv        getty.Server
 	cli        getty.Client
 	sessions   []getty.Session
 	replies    chan struct{}
@@ -340,14 +413,20 @@ func newBenchEcho(b *testing.B, transport string, codec getty.ReadWriter, compre
 	// a server and its event loop behind for the rest of the run.
 	b.Cleanup(e.close)
 
+	// udp is one shared server session over a packet conn, so it has no pool and
+	// no per-connection framing: the datagram is the message.
+	if transport == "udp" {
+		return newBenchUDPEcho(b, e, codec)
+	}
+
 	switch transport {
 	case "tcp":
-		e.srv = getty.NewTCPServer(getty.WithLocalAddress("127.0.0.1:0")).(getty.StreamServer)
+		e.srv = getty.NewTCPServer(getty.WithLocalAddress("127.0.0.1:0"))
 	case "ws":
 		e.srv = getty.NewWSServer(
 			getty.WithLocalAddress("127.0.0.1:0"),
 			getty.WithWebsocketServerPath(wsPath),
-		).(getty.StreamServer)
+		)
 	default:
 		b.Fatalf("unknown transport %q", transport)
 	}
@@ -356,7 +435,7 @@ func newBenchEcho(b *testing.B, transport string, codec getty.ReadWriter, compre
 		return nil
 	})
 
-	addr := e.srv.Listener().Addr().String()
+	addr := e.srv.(getty.StreamServer).Listener().Addr().String()
 	switch transport {
 	case "tcp":
 		e.cli = getty.NewTCPClient(getty.WithServerAddress(addr), getty.WithConnectionNumber(conns))
@@ -395,6 +474,36 @@ func newBenchEcho(b *testing.B, transport string, codec getty.ReadWriter, compre
 		}
 	}
 
+	return e
+}
+
+// newBenchUDPEcho builds the udp variant: a packet endpoint serving one shared
+// session, and one connected udp client. Compression is not applied - getty does
+// not support it on udp.
+func newBenchUDPEcho(b *testing.B, e *benchEcho, codec getty.ReadWriter) *benchEcho {
+	b.Helper()
+
+	e.srv = getty.NewUDPEndPoint(getty.WithLocalAddress("127.0.0.1:0"))
+	e.srv.RunEventLoop(func(ss getty.Session) error {
+		setHandler(ss, codec, udpEchoListener{}, getty.CompressNone)
+		return nil
+	})
+	addr := e.srv.(getty.PacketServer).PacketConn().LocalAddr().String()
+
+	ready := make(chan getty.Session, 1)
+	e.cli = getty.NewUDPClient(getty.WithServerAddress(addr), getty.WithConnectionNumber(1))
+	go e.cli.RunEventLoop(func(ss getty.Session) error {
+		setHandler(ss, codec, replyListener{replies: e.replies}, getty.CompressNone)
+		ready <- ss
+		return nil
+	})
+
+	select {
+	case ss := <-ready:
+		e.sessions = append(e.sessions, ss)
+	case <-time.After(dialTimeout):
+		b.Fatal("udp client session did not come up")
+	}
 	return e
 }
 

@@ -20,6 +20,7 @@ package benchmark
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 import (
@@ -43,16 +44,20 @@ func BenchmarkEchoPingPong(b *testing.B) {
 				e := newBenchEcho(b, transport, lengthPrefixedCodec{}, getty.CompressNone, 1)
 				ss := e.sessions[0]
 				payload := benchPayload(size)
+				latency := newLatencyRecorder(b.N)
 				b.SetBytes(int64(size))
 				b.ReportAllocs()
 				b.StartTimer()
 
 				for i := 0; i < b.N; i++ {
+					start := time.Now()
 					if _, _, err := ss.WritePkg(payload, 0); err != nil {
 						b.Fatal(err)
 					}
 					e.waitReply(b)
+					latency.record(time.Since(start))
 				}
+				latency.report(b)
 			})
 		}
 	}
@@ -150,6 +155,35 @@ func BenchmarkEchoCompression(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+// BenchmarkEchoUDP is the datagram round trip: one connected udp client against
+// a packet endpoint that writes each datagram back. Sizes stay under the
+// smallest common datagram limit (macOS caps one at 9216 bytes by default).
+func BenchmarkEchoUDP(b *testing.B) {
+	for _, size := range []int{64, 1 << 10, 4 << 10} {
+		b.Run(sizeName(size), func(b *testing.B) {
+			b.StopTimer()
+			e := newBenchEcho(b, "udp", udpEchoCodec{}, getty.CompressNone, 1)
+			ss := e.sessions[0]
+			payload := benchPayload(size)
+			latency := newLatencyRecorder(b.N)
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.StartTimer()
+
+			ctx := getty.UDPContext{Pkg: payload}
+			for i := 0; i < b.N; i++ {
+				start := time.Now()
+				if _, _, err := ss.WritePkg(ctx, 0); err != nil {
+					b.Fatal(err)
+				}
+				e.waitReply(b)
+				latency.record(time.Since(start))
+			}
+			latency.report(b)
+		})
 	}
 }
 
