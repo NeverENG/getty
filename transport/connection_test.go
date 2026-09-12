@@ -1042,3 +1042,28 @@ func TestCodecSendStallDetectionOutrunsLongPollInterval(t *testing.T) {
 		})
 	}
 }
+
+// TestConnectionSendBatchKeepsCallerBuffers pins the batched-write contract:
+// Send must not consume the caller's slice. net.Buffers.WriteTo nils out each
+// element of the slice it is handed (net/net.go consume), and Send used to hand
+// it the caller's own batch, so a caller reusing it wrote nothing from the
+// second call on while both calls still reported success - which is exactly
+// what Session.WriteBytesArray exposes to users.
+func TestConnectionSendBatchKeepsCallerBuffers(t *testing.T) {
+	conn := newGettyTCPConn(&timeoutAccessorNetConn{})
+	pkgs := [][]byte{[]byte("hello"), []byte("world")}
+
+	for i := 1; i <= 2; i++ {
+		lg, err := conn.Send(pkgs)
+		if err != nil {
+			t.Fatalf("Send call %d: %v", i, err)
+		}
+		if lg != 10 {
+			t.Fatalf("Send call %d wrote %d bytes, want 10", i, lg)
+		}
+		if len(pkgs[0]) != 5 || len(pkgs[1]) != 5 {
+			t.Fatalf("Send call %d consumed the caller's buffers: len(pkgs[0])=%d len(pkgs[1])=%d, want 5 and 5",
+				i, len(pkgs[0]), len(pkgs[1]))
+		}
+	}
+}
