@@ -347,22 +347,24 @@ func (s *server) runTCPEventLoop(newSession NewSessionCallback) {
 			}
 			client, err = s.accept(newSession)
 			if err != nil {
-				//	change the error checking from "netErr.Temporary()" to "netErr.Timeout()".
-				//  as per https://github.com/golang/go/issues/45729,
-				//  Timeout() correctly captures subset of Temporary() errors that could be retried.
-				//  The rest of Temporary() errors should not be retried anyway (like syscall errors, out of file descriptors)
-				if netErr, ok := perrors.Cause(err).(net.Error); ok && netErr.Timeout() {
-					if delay == 0 {
-						delay = 5 * time.Millisecond
-					} else {
-						delay *= 2
-					}
-					if max := 1 * time.Second; delay > max {
-						delay = max
-					}
-					continue
+				//	Accept timeouts (per https://github.com/golang/go/issues/45729,
+				//  Timeout() captures the retryable subset of the old Temporary()) are
+				//  retried quietly; every other error - EMFILE/ENFILE from fd exhaustion,
+				//  for instance - is reported.
+				if netErr, ok := perrors.Cause(err).(net.Error); !ok || !netErr.Timeout() {
+					log.Warnf("server{%s}.Accept() = err {%+v}", s.addr, perrors.WithStack(err))
 				}
-				log.Warnf("server{%s}.Accept() = err {%+v}", s.addr, perrors.WithStack(err))
+				// #130: any persistent accept error must back off, not only a timeout.
+				//  Re-calling Accept at full speed spins the CPU and floods the log
+				//  exactly when the process is out of resources.
+				if delay == 0 {
+					delay = 5 * time.Millisecond
+				} else {
+					delay *= 2
+				}
+				if max := 1 * time.Second; delay > max {
+					delay = max
+				}
 				continue
 			}
 			delay = 0

@@ -614,6 +614,19 @@ func (s *session) WriteBytes(pkg []byte) (int, error) {
 		return 0, ErrSessionClosed
 	}
 
+	// #128: one gettyWSConn.Send is one whole WS message, so a package bigger
+	// than maxPacketLen has to leave in a single Send. Fragmenting it would
+	// produce several independent messages, and the peer's reader - which has
+	// no cross-message buffering - can never reassemble them. WS itself has no
+	// 16 KiB message limit, so the payload goes out as one message.
+	if _, ok := conn.(*gettyWSConn); ok {
+		lg, err := conn.Send(pkg)
+		if err != nil {
+			return lg, perrors.Wrapf(err, "s.Connection.Write(pkg len:%d)", len(pkg))
+		}
+		return totalSize, nil
+	}
+
 	for leftPackageSize > maxPacketLen {
 		_, err := conn.Send(pkg[writeSize:(writeSize + maxPacketLen)])
 		if err != nil {
@@ -657,9 +670,30 @@ func (s *session) WriteBytesArray(pkgs ...[]byte) (int, error) {
 		defer s.packetLock.RUnlock()
 		lg, err := conn.Send(pkgs)
 		if err != nil {
-			return 0, perrors.Wrapf(err, "s.Connection.Write(pkgs num:%d)", len(pkgs))
+			// net.Buffers.WriteTo (writev) can write a prefix and then fail:
+			// report those bytes instead of pretending nothing went out, which
+			// would make a caller resend an already-delivered prefix.
+			return lg, perrors.Wrapf(err, "s.Connection.Write(pkgs num:%d)", len(pkgs))
 		}
 		return lg, nil
+	}
+
+	// #128: on WS every Send is one message, so merging the batch would let the
+	// peer's reader decode only the first package and silently drop the rest.
+	// Send each package on its own and report the bytes accepted so far when
+	// one of the sends fails.
+	if _, ok := conn.(*gettyWSConn); ok {
+		s.packetLock.RLock()
+		defer s.packetLock.RUnlock()
+		total := 0
+		for i := range pkgs {
+			lg, err := conn.Send(pkgs[i])
+			total += lg
+			if err != nil {
+				return total, perrors.Wrapf(err, "s.Connection.Write(pkgs num:%d)", len(pkgs))
+			}
+		}
+		return total, nil
 	}
 
 	// get len
@@ -689,7 +723,9 @@ func (s *session) WriteBytesArray(pkgs ...[]byte) (int, error) {
 
 	wlg, err = s.WriteBytes(arr)
 	if err != nil {
-		return 0, perrors.WithStack(err)
+		// WriteBytes returns the bytes it already wrote, e.g. the fragments
+		// that went out before the failing one: keep that count.
+		return wlg, perrors.WithStack(err)
 	}
 
 	num := len(pkgs) - 1
@@ -873,6 +909,15 @@ func (s *session) handlePackage() {
 	} else if _, ok := s.Connection.(*gettyWSConn); ok {
 		err = s.handleWSPackage()
 	} else if _, ok := s.Connection.(*gettyUDPConn); ok {
+		// #130 item 6: without a reader the datagram loop panics on the first
+		// datagram with an obscure nil dereference. Fail with the same
+		// configuration error as the TCP branch, naming the real problem.
+		if s.reader == nil {
+			errStr := fmt.Sprintf("session{name:%s, conn:%#v, reader:%#v}", s.name, s.Connection, s.reader)
+			log.Error(errStr)
+			panic(errStr)
+		}
+
 		err = s.handleUDPPackage()
 	} else {
 		panic(fmt.Sprintf("unknown type session{%#v}", s))
@@ -1078,6 +1123,14 @@ func (s *session) handleWSPackage() error {
 			if err != nil {
 				log.Warnf("%s, [session.handleWSPackage] = len:%d, error:%+v",
 					s.sessionToken(), length, perrors.WithStack(err))
+				continue
+			}
+
+			// #128: a reader that returns (nil, 0, nil) has no complete package
+			// in this message yet. Unlike TCP there is no buffered remainder to
+			// grow, but the next message may still complete the package, so keep
+			// reading instead of handing a nil package to the listener.
+			if unmarshalPkg == nil {
 				continue
 			}
 
