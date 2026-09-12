@@ -23,8 +23,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -402,6 +404,13 @@ func (l *latencyRecorder) report(b *testing.B) {
 	b.StopTimer()
 	sorted := append([]time.Duration(nil), l.samples...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	if sorted[len(sorted)-1] == 0 {
+		// Some platforms report a zero interval for a fast loop (coarse timer
+		// inside a VM, for instance). Publishing p50=0 would be worse than
+		// publishing nothing, so leave the percentiles out and say so.
+		b.ReportMetric(0, "p50-ns(clock-too-coarse)")
+		return
+	}
 	percentile := func(p float64) float64 {
 		idx := int(float64(len(sorted)-1) * p)
 		return float64(sorted[idx].Nanoseconds())
@@ -555,8 +564,10 @@ func (e *benchEcho) warmUpUDP(b *testing.B) {
 		}
 	}
 	b.Skipf("udp echo round trip could not be established in %d attempts: the server received %d datagrams, the client received %d. "+
-		"The udp endpoint round trip needs a look before this case can be measured; skipping it rather than failing every other case.",
-		udpWarmupAttempts, e.serverRecv.Load(), e.clientRecv.Load())
+		"The udp endpoint round trip needs a look before this case can be measured; skipping it rather than failing every other case. "+
+		"Report this line with the environment below: %s/%s go%s",
+		udpWarmupAttempts, e.serverRecv.Load(), e.clientRecv.Load(),
+		runtime.GOOS, runtime.GOARCH, strings.TrimPrefix(runtime.Version(), "go"))
 }
 
 func setHandler(ss getty.Session, codec getty.ReadWriter, listener getty.EventListener, compress getty.CompressType) {
