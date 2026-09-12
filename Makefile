@@ -21,12 +21,14 @@ MAKEFLAGS += --warn-undefined-variables
 MAKEFLAGS += --no-builtin-rules
 MAKEFLAGS += --no-print-directory
 
-.PHONY: help test test-race fmt check-fmt clean lint install-golangci-lint install-imports-formatter
+.PHONY: help test test-race bench bench-echo fmt check-fmt clean lint install-golangci-lint install-imports-formatter
 
 help:
 	@echo "Available commands:"
 	@echo "  test       - Run unit tests with coverage"
 	@echo "  test-race  - Run transport race tests"
+	@echo "  bench      - Run the full benchmark suite (loopback TCP/WS/UDP)"
+	@echo "  bench-echo - Run only the client/server echo benchmarks"
 	@echo "  fmt        - Format code"
 	@echo "  check-fmt  - Verify formatting without modifying tracked files"
 	@echo "  lint       - Run golangci-lint"
@@ -38,6 +40,17 @@ test: clean
 
 test-race:
 	GOTOOLCHAIN=go1.25.0+auto go test -race ./transport -count=1
+
+# Benchmarks live in ./benchmark and are deliberately not part of the CI gate:
+# they talk to a real loopback socket, so their absolute numbers move with the
+# machine. Compare runs with benchstat, e.g.
+#   make bench > old.txt && git switch my-change && make bench > new.txt
+#   benchstat old.txt new.txt
+bench:
+	GOTOOLCHAIN=go1.25.0+auto go test -run '^$$' -bench . -benchmem -benchtime=1s ./benchmark
+
+bench-echo:
+	GOTOOLCHAIN=go1.25.0+auto go test -run '^$$' -bench 'BenchmarkEcho' -benchmem -benchtime=1s ./benchmark
 
 fmt: install-imports-formatter
 	go fmt ./... && GOROOT=$(shell go env GOROOT) imports-formatter
