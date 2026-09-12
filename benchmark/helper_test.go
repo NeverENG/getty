@@ -247,8 +247,13 @@ func drainListener(tb testing.TB) (string, func()) {
 		tb.Fatalf("net.Listen: %v", err)
 	}
 
-	var conns sync.Map
+	var (
+		conns    sync.Map
+		acceptWG sync.WaitGroup
+	)
+	acceptWG.Add(1)
 	go func() {
+		defer acceptWG.Done()
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -263,6 +268,9 @@ func drainListener(tb testing.TB) (string, func()) {
 
 	return ln.Addr().String(), func() {
 		_ = ln.Close()
+		// The accept goroutine must be gone before the range below, otherwise it
+		// can store a connection that nothing will ever close.
+		acceptWG.Wait()
 		conns.Range(func(k, _ any) bool {
 			_ = k.(net.Conn).Close()
 			return true

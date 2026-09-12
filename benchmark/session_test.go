@@ -18,6 +18,7 @@
 package benchmark
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"testing"
@@ -234,13 +235,17 @@ func BenchmarkSessionLifecycle(b *testing.B) {
 	})
 	addr := srv.(getty.StreamServer).Listener().Addr().String()
 	b.Cleanup(srv.Close)
+	// A bare net.Dial has no timeout, so a stalled connect would be charged to
+	// the measured loop.
+	dialer := &net.Dialer{Timeout: dialTimeout}
+	ctx := context.Background()
 	b.ReportAllocs()
 	b.StartTimer()
 
 	for i := 0; i < b.N; i++ {
-		conn, err := net.Dial("tcp", addr)
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
-			b.Fatalf("net.Dial: %v", err)
+			b.Fatalf("dial %s: %v", addr, err)
 		}
 		<-accepted
 		// Reset rather than FIN: a benchmark that dials in a tight loop would
