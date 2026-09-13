@@ -826,6 +826,15 @@ func (t *gettyTCPConn) Send(pkg any) (int, error) {
 			*scratch = append((*scratch)[:0], buffers...)
 			netBuf := net.Buffers(*scratch)
 			lg, err = netBuf.WriteTo(t.conn)
+			// consume() nils only the headers it wrote, so a partial write leaves
+			// the rest pointing at the caller's payloads. Clear every slot before
+			// the pool keeps the entry: a pooled scratch slice must not retain
+			// references to caller data until its next use.
+			slots := (*scratch)[:cap(*scratch)]
+			for i := range slots {
+				slots[i] = nil
+			}
+			*scratch = (*scratch)[:0]
 			buffersScratchPool.Put(scratch)
 		} else if bw, ok := writer.(buffersWriter); ok {
 			lg, err = bw.WriteBuffers(buffers)

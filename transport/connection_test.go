@@ -1067,3 +1067,46 @@ func TestConnectionSendBatchKeepsCallerBuffers(t *testing.T) {
 		}
 	}
 }
+
+// partialWriteNetConn writes the requested prefix and then fails, so
+// net.Buffers.WriteTo consumes only part of the batch.
+type partialWriteNetConn struct {
+	prefix int
+}
+
+func (c *partialWriteNetConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *partialWriteNetConn) Write(p []byte) (int, error) {
+	n := c.prefix
+	if n > len(p) {
+		n = len(p)
+	}
+	return n, perrors.New("write failed after a prefix")
+}
+func (*partialWriteNetConn) Close() error                     { return nil }
+func (*partialWriteNetConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (*partialWriteNetConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (*partialWriteNetConn) SetDeadline(time.Time) error      { return nil }
+func (*partialWriteNetConn) SetReadDeadline(time.Time) error  { return nil }
+func (*partialWriteNetConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestBuffersScratchPoolDoesNotRetainPayloads pins that the pooled slice-of-slice
+// headers used by the batched write path are cleared before the entry goes back
+// to the pool. net.Buffers.consume nils only the headers it wrote, so after a
+// partial write the remaining slots still point at the caller's payloads, and a
+// pooled entry would keep them reachable.
+func TestBuffersScratchPoolDoesNotRetainPayloads(t *testing.T) {
+	conn := newGettyTCPConn(&partialWriteNetConn{prefix: 2})
+	pkgs := [][]byte{[]byte("first"), []byte("second"), []byte("third")}
+
+	if _, err := conn.Send(pkgs); err == nil {
+		t.Fatal("Send over a partially failing connection returned no error")
+	}
+
+	scratch := buffersScratchPool.Get().(*[][]byte)
+	defer buffersScratchPool.Put(scratch)
+	for i, slot := range (*scratch)[:cap(*scratch)] {
+		if slot != nil {
+			t.Fatalf("pooled scratch slot %d still references a payload (%d bytes)", i, len(slot))
+		}
+	}
+}
