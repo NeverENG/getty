@@ -19,6 +19,7 @@ package getty
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -1279,7 +1280,9 @@ func newGatedWSPair(t *testing.T) (ss *session, gated *gatedWriteConn, peer *web
 	gatedCh := make(chan *gatedWriteConn, 1)
 	dialer := websocket.Dialer{
 		NetDial: func(network, addr string) (net.Conn, error) {
-			raw, err := net.Dial(network, addr)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			raw, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
