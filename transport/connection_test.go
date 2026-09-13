@@ -1073,9 +1073,10 @@ func (l *debugCountingLogger) Debugf(string, ...any) {
 // must not build the log record at all.
 func TestConnectionSendSkipsDebugLoggingWhenDisabled(t *testing.T) {
 	previousLogger := gettylog.GetLogger()
-	wasDebugEnabled := gettylog.IsDebugEnabled()
+	previousLevel := gettylog.GetLoggerLevel()
 
-	// level first: SetLoggerLevel installs the built-in sugared logger
+	// level first: SetLoggerLevel installs the built-in sugared logger, so the
+	// recorder has to be installed after it
 	if err := gettylog.SetLoggerLevel(gettylog.LoggerLevelWarn); err != nil {
 		t.Fatal(err)
 	}
@@ -1083,14 +1084,12 @@ func TestConnectionSendSkipsDebugLoggingWhenDisabled(t *testing.T) {
 	gettylog.SetLogger(recorder)
 
 	t.Cleanup(func() {
-		gettylog.SetLogger(previousLogger)
-		level := gettylog.LoggerLevelWarn
-		if wasDebugEnabled {
-			level = gettylog.LoggerLevelDebug
-		}
-		if err := gettylog.SetLoggerLevel(level); err != nil {
+		// same order on the way out: the level restores the built-in logger, and
+		// the saved logger goes back last, so both are exactly what they were
+		if err := gettylog.SetLoggerLevel(previousLevel); err != nil {
 			t.Error(err)
 		}
+		gettylog.SetLogger(previousLogger)
 	})
 
 	if gettylog.IsDebugEnabled() {

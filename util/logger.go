@@ -132,6 +132,13 @@ func IsDebugEnabled() bool {
 	return zapLoggerConfig.Level.Enabled(zapcore.DebugLevel)
 }
 
+// GetLoggerLevel returns the level configured through SetLoggerLevel, so a
+// caller can restore it exactly. Like IsDebugEnabled it describes the built-in
+// logger; a logger installed with SetLogger does not report its own level here.
+func GetLoggerLevel() LoggerLevel {
+	return LoggerLevel(zapLoggerConfig.Level.Level())
+}
+
 // SetLoggerCallerDisable disable caller info in production env for performance improve.
 // It is highly recommended that you execute this method in a production environment.
 func SetLoggerCallerDisable() error {
