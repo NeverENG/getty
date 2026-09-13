@@ -37,7 +37,7 @@ test: clean
 	GOTOOLCHAIN=go1.25.0+auto go test ./... -count=1 -coverprofile=coverage.txt -covermode=atomic
 
 test-race:
-	GOTOOLCHAIN=go1.25.0+auto go test -race ./transport -count=1
+	GOTOOLCHAIN=go1.25.0+auto go test -race ./transport ./util -count=1
 
 fmt: install-imports-formatter
 	go fmt ./... && GOROOT=$(shell go env GOROOT) imports-formatter
