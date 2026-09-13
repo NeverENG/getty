@@ -343,7 +343,14 @@ func (s *server) runTCPEventLoop(newSession NewSessionCallback) {
 				return
 			}
 			if delay != 0 {
-				<-gxtime.After(delay)
+				// #130: do not sit out the back-off when the server is closing -
+				// Close() waits for this goroutine, and a full delay would also
+				// let the loop call Accept once more before checking IsClosed().
+				select {
+				case <-s.done:
+					return
+				case <-gxtime.After(delay):
+				}
 			}
 			client, err = s.accept(newSession)
 			if err != nil {

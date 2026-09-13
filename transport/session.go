@@ -683,8 +683,14 @@ func (s *session) WriteBytesArray(pkgs ...[]byte) (int, error) {
 	// Send each package on its own and report the bytes accepted so far when
 	// one of the sends fails.
 	if _, ok := conn.(*gettyWSConn); ok {
-		s.packetLock.RLock()
-		defer s.packetLock.RUnlock()
+		// #128: the batch must hold the write lock, not the read lock. A ws
+		// connection serialises one WriteMessage at a time, not the whole loop,
+		// so with a read lock a concurrent Send/WriteBytes could land between
+		// two of this batch's messages (A1, B1, A2) and the peer would see a
+		// batch it cannot recognise. The tcp path gets this for free because its
+		// whole batch is one conn.Send.
+		s.packetLock.Lock()
+		defer s.packetLock.Unlock()
 		total := 0
 		for i := range pkgs {
 			lg, err := conn.Send(pkgs[i])

@@ -1191,3 +1191,155 @@ func TestUDPHandlePackageWithoutReaderFailsConfiguration(t *testing.T) {
 			"a misconfigured session must report the missing reader up front")
 	}
 }
+
+// gatedWriteConn wraps the socket underneath a websocket client connection and
+// parks its first Write after arm() until releaseFirst(), so a test can hold a
+// write in flight and observe what a concurrent writer is allowed to do.
+//
+// The handshake goes through the same connection, which is why the gate is armed
+// only after Dial returns.
+type gatedWriteConn struct {
+	net.Conn
+
+	mu      sync.Mutex
+	armed   bool
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *gatedWriteConn) arm() {
+	c.mu.Lock()
+	if !c.armed {
+		c.armed = true
+		c.entered = make(chan struct{})
+		c.release = make(chan struct{})
+	}
+	c.mu.Unlock()
+}
+
+func (c *gatedWriteConn) waitEntered(t *testing.T) {
+	t.Helper()
+
+	c.mu.Lock()
+	entered := c.entered
+	c.mu.Unlock()
+	if entered == nil {
+		t.Fatal("gated connection was never armed")
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no write reached the gated connection")
+	}
+}
+
+func (c *gatedWriteConn) releaseFirst() {
+	c.mu.Lock()
+	release := c.release
+	c.mu.Unlock()
+	if release != nil {
+		close(release)
+	}
+}
+
+func (c *gatedWriteConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	armed, entered, release := c.armed, c.entered, c.release
+	c.mu.Unlock()
+
+	if armed {
+		c.once.Do(func() {
+			close(entered)
+			<-release
+		})
+	}
+	return c.Conn.Write(p)
+}
+
+// newGatedWSPair returns a session over a websocket connection whose first write
+// after arm() is parked, plus the gated socket and the peer side of the pair.
+func newGatedWSPair(t *testing.T) (ss *session, gated *gatedWriteConn, peer *websocket.Conn) {
+	t.Helper()
+
+	var (
+		upgrader = websocket.Upgrader{}
+		serverCh = make(chan *websocket.Conn, 1)
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		serverCh <- conn
+	}))
+	t.Cleanup(srv.Close)
+
+	gatedCh := make(chan *gatedWriteConn, 1)
+	dialer := websocket.Dialer{
+		NetDial: func(network, addr string) (net.Conn, error) {
+			raw, err := net.Dial(network, addr)
+			if err != nil {
+				return nil, err
+			}
+			conn := &gatedWriteConn{Conn: raw}
+			gatedCh <- conn
+			return conn, nil
+		},
+	}
+	clientWS, resp, err := dialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial websocket test server: %v", err)
+	}
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	t.Cleanup(func() { _ = clientWS.Close() })
+	gated = <-gatedCh
+
+	select {
+	case peer = <-serverCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("websocket test server did not hand over the upgraded connection")
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+
+	return newWSSession(clientWS, nil).(*session), gated, peer
+}
+
+// Regression test for the ws batch lock: WriteBytesArray sends one message per
+// pkg, so it must hold packetLock exclusively. A read lock lets another writer
+// start in the gap between two of the batch's messages - one WriteMessage at a
+// time is not enough, because the gap between messages is exactly the window -
+// and the peer then sees a batch it cannot recognise. The tcp path cannot do
+// that, since its whole batch is a single conn.Send.
+//
+// The batch is parked inside its first write while the probe runs, so this says
+// something about a real in-flight write rather than about the code's shape. A
+// message-order assertion cannot be made deterministic here: gettyWSConn.writeLock
+// serialises the concurrent WriteMessage as long as a write is parked inside a
+// message, and between two messages the winner is a scheduler coin toss.
+func TestWSBatchWriteHoldsExclusiveLock(t *testing.T) {
+	ss, gated, _ := newGatedWSPair(t)
+	gated.arm()
+
+	batchDone := make(chan error, 1)
+	go func() {
+		_, err := ss.WriteBytesArray([]byte("A1"), []byte("A2"))
+		batchDone <- err
+	}()
+	gated.waitEntered(t)
+
+	if ss.packetLock.TryRLock() {
+		ss.packetLock.RUnlock()
+		gated.releaseFirst()
+		<-batchDone
+		t.Fatal("another writer could take the read lock while a ws batch was mid-flight: the batch is not protected across its messages")
+	}
+
+	gated.releaseFirst()
+	if err := <-batchDone; err != nil {
+		t.Fatalf("WriteBytesArray: %v", err)
+	}
+}
