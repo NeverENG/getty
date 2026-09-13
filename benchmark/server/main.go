@@ -139,6 +139,24 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Validate the flags the way -mode and -log_level are validated. A bad
+	// -compress used to be rejected per connection inside the session callback,
+	// whose error is only logged at warn level - below this program's default
+	// -log_level error - so the server accepted and dropped every connection and
+	// the cause never appeared anywhere.
+	var compressType getty.CompressType
+	switch *compress {
+	case "":
+		compressType = getty.CompressNone
+	case "zip":
+		compressType = getty.CompressZip
+	case "snappy":
+		compressType = getty.CompressSnappy
+	default:
+		fmt.Fprintf(os.Stderr, "unknown -compress %q, want zip or snappy\n", *compress)
+		os.Exit(2)
+	}
+
 	c := &counters{}
 	var (
 		handler  getty.ReadWriter
@@ -161,14 +179,8 @@ func main() {
 		ss.SetMaxMsgLen(*maxMsgLen)
 		ss.SetReadTimeout(*readTimeout)
 		ss.SetWriteTimeout(time.Minute)
-		switch *compress {
-		case "":
-		case "zip":
-			ss.SetCompressType(getty.CompressZip)
-		case "snappy":
-			ss.SetCompressType(getty.CompressSnappy)
-		default:
-			return fmt.Errorf("unknown -compress %q, want zip or snappy", *compress)
+		if compressType != getty.CompressNone {
+			ss.SetCompressType(compressType)
 		}
 		return nil
 	})

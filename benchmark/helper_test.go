@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"sort"
 	"strconv"
@@ -563,11 +564,17 @@ func (e *benchEcho) warmUpUDP(b *testing.B) {
 			return
 		}
 	}
-	b.Skipf("udp echo round trip could not be established in %d attempts: the server received %d datagrams, the client received %d. "+
+	reason := fmt.Sprintf("udp echo round trip could not be established in %d attempts: the server received %d datagrams, the client received %d. "+
 		"The udp endpoint round trip needs a look before this case can be measured; skipping it rather than failing every other case. "+
-		"Report this line with the environment below: %s/%s go%s",
+		"Environment: %s/%s go%s",
 		udpWarmupAttempts, e.serverRecv.Load(), e.clientRecv.Load(),
 		runtime.GOOS, runtime.GOARCH, strings.TrimPrefix(runtime.Version(), "go"))
+	// testing buffers a skip's message and its "--- SKIP:" line and only prints
+	// them with -v, and none of the make targets pass -v - so a case that did
+	// not run would vanish from `make bench` output entirely. Write the reason
+	// to stderr as well, where it is always visible.
+	fmt.Fprintln(os.Stderr, "benchmark: skipping", b.Name()+":", reason)
+	b.Skip(reason)
 }
 
 func setHandler(ss getty.Session, codec getty.ReadWriter, listener getty.EventListener, compress getty.CompressType) {

@@ -201,18 +201,24 @@ func BenchmarkSessionAccessors(b *testing.B) {
 	b.StopTimer()
 	ss := newWriteSession(b, nopCodec{}, getty.CompressNone)
 
-	benches := map[string]func(){
-		"IsClosed":     func() { _ = ss.IsClosed() },
-		"Stat":         func() { _ = ss.Stat() },
-		"EndPoint":     func() { _ = ss.EndPoint() },
-		"WriteTimeout": func() { _ = ss.WriteTimeout() },
-		"GetAttribute": func() { _ = ss.GetAttribute("missing") },
+	// an ordered slice, not a map: these sub-benchmarks share one session, so
+	// whichever runs first pays its cold start, and a map would reshuffle that
+	// cost between runs of what is meant to be a comparable measurement
+	benches := []struct {
+		name string
+		fn   func()
+	}{
+		{"IsClosed", func() { _ = ss.IsClosed() }},
+		{"Stat", func() { _ = ss.Stat() }},
+		{"EndPoint", func() { _ = ss.EndPoint() }},
+		{"WriteTimeout", func() { _ = ss.WriteTimeout() }},
+		{"GetAttribute", func() { _ = ss.GetAttribute("missing") }},
 	}
-	for name, fn := range benches {
-		b.Run(name, func(b *testing.B) {
+	for _, bc := range benches {
+		b.Run(bc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				fn()
+				bc.fn()
 			}
 		})
 	}
